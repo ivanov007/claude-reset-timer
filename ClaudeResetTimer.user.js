@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Claude Reset Timer + Auto-Send
 // @namespace    ivanov007.userscripts
-// @version      2.1.3
+// @version      2.1.4
 // @description  Floating panel that detects Claude's rate-limit via fetch, modal, or inline banner. Shows countdown, manual time edit, and auto-clicks Send on reset. Supports English, Spanish, and French.
 // @author       ivanov007
 // @match        https://claude.ai/*
@@ -128,18 +128,23 @@
       y: typeof raw.y === 'number' ? raw.y : null,
       autoSend: !!raw.autoSend,
       resetAt: typeof raw.resetAt === 'number' ? raw.resetAt : null,
+      sentForResetAt: typeof raw.sentForResetAt === 'number' ? raw.sentForResetAt : null,
       snap: raw.snap || { left: false, right: true, top: false, bottom: true },
       lang: supportedLangs.includes(raw.lang) ? raw.lang : lang,
     };
   }
 
   const state = Object.assign(
-    { x: null, y: null, autoSend: false, resetAt: null, snap: null, lang },
+    { x: null, y: null, autoSend: false, resetAt: null, sentForResetAt: null, snap: null, lang },
     sanitizeState(GM_getValue(STORAGE_KEY, {}))
   );
 
   function saveState() {
     GM_setValue(STORAGE_KEY, state);
+  }
+
+  function alreadySentForCurrentCycle() {
+    return state.resetAt !== null && state.sentForResetAt === state.resetAt;
   }
 
   let autoSendTimer = null;
@@ -615,6 +620,7 @@
     clearAutoSend();
     sendAttempts = 0;
     if (!state.resetAt) return;
+    if (alreadySentForCurrentCycle()) return;
     const delay = state.resetAt - Date.now();
     if (delay <= 0) {
       attemptSend();
@@ -678,12 +684,15 @@
     } else {
       setStatus(t.statusSentOk);
       sendAttempts = 0;
+      state.sentForResetAt = state.resetAt;
+      saveState();
     }
   }
 
   function attemptSend() {
     autoSendTimer = null; // the timeout that called us has expired
     if (!state.autoSend) return;
+    if (alreadySentForCurrentCycle()) return;
 
     if (sendAttempts >= MAX_SEND_ATTEMPTS) {
       setStatus(t.statusTooManyRetries);
@@ -717,7 +726,7 @@
   }
 
   // Resume on page load
-  if (state.autoSend && state.resetAt) {
+  if (state.autoSend && state.resetAt && !alreadySentForCurrentCycle()) {
     if (state.resetAt > Date.now()) {
       scheduleAutoSend();
     } else {
@@ -727,7 +736,8 @@
 
   // ======================== WATCHDOG ========================
   setInterval(() => {
-    if (state.autoSend && state.resetAt && Date.now() >= state.resetAt && !autoSendTimer) {
+    if (state.autoSend && state.resetAt && !alreadySentForCurrentCycle() &&
+        Date.now() >= state.resetAt && !autoSendTimer) {
       console.log('[ClaudeResetTimer] watchdog:', t.statusWatchdog);
       attemptSend();
     }
