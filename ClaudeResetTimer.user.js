@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Claude Reset Timer + Auto-Send
 // @namespace    ivanov007.userscripts
-// @version      2.1.4
+// @version      2.1.5
 // @description  Floating panel that detects Claude's rate-limit via fetch, modal, or inline banner. Shows countdown, manual time edit, and auto-clicks Send on reset. Supports English, Spanish, and French.
 // @author       ivanov007
 // @match        https://claude.ai/*
@@ -58,6 +58,7 @@
         /hasta(?: las)?\s+(\d{1,2}:\d{2}(?:\s?[AP]M)?)/i,
       ],
       sendBtnLabels: ['Send message', 'Enviar mensaje', 'Envoyer le message'],
+      continueBtnLabels: ['continuar', 'continue', 'continuer'],
       ampm: true,
     },
     en: {
@@ -87,6 +88,7 @@
         /until\s+(\d{1,2}:\d{2}(?:\s?[AP]M)?)/i,
       ],
       sendBtnLabels: ['Send message', 'Enviar mensaje', 'Envoyer le message'],
+      continueBtnLabels: ['continue', 'continuar', 'continuer'],
       ampm: true,
     },
     fr: {
@@ -115,6 +117,7 @@
         /jusqu['’]?[aà]\s+(\d{1,2}[h:]\d{2})/i,
       ],
       sendBtnLabels: ['Envoyer le message', 'Send message', 'Enviar mensaje'],
+      continueBtnLabels: ['continuer', 'continue', 'continuar'],
       ampm: false,
     },
   };
@@ -646,6 +649,23 @@
     });
   }
 
+  // El botón "Continue" no tiene aria-label: se identifica por texto exacto.
+  // Se excluyen los botones del propio panel.
+  function findContinueButton() {
+    const labels = t.continueBtnLabels;
+    return [...document.querySelectorAll('button')].find(b => {
+      if (panel.contains(b)) return false;
+      const txt = (b.textContent || '').trim().toLowerCase();
+      return labels.includes(txt);
+    }) || null;
+  }
+
+  function isButtonEnabled(btn) {
+    return !!btn && !btn.disabled && btn.getAttribute('aria-disabled') !== 'true';
+  }
+
+  let lastClick = null; // { el, kind: 'send' | 'continue' }
+
   function synthClick(el) {
     const rect = el.getBoundingClientRect();
     const x = rect.left + rect.width / 2;
@@ -666,11 +686,20 @@
 
   function verifySendResult() {
     autoSendTimer = null; // the timeout that called us has expired
-    const composer = document.querySelector('div.ProseMirror');
-    const stillHasText = !!composer && composer.innerText.trim().length > 0;
-    console.log('[ClaudeResetTimer] post-click verification', new Date().toLocaleTimeString(), { stillHasText });
 
-    if (stillHasText) {
+    let failed;
+    if (lastClick && lastClick.kind === 'continue') {
+      // Continuar: éxito si el botón desapareció o volvió a deshabilitarse
+      const stillThere = document.contains(lastClick.el) && isButtonEnabled(lastClick.el);
+      failed = stillThere;
+      console.log('[ClaudeResetTimer] post-click verification (continue)', new Date().toLocaleTimeString(), { stillThere });
+    } else {
+      const composer = document.querySelector('div.ProseMirror');
+      failed = !!composer && composer.innerText.trim().length > 0;
+      console.log('[ClaudeResetTimer] post-click verification (send)', new Date().toLocaleTimeString(), { stillHasText: failed });
+    }
+
+    if (failed) {
       setStatus(t.statusClickNoEffect);
       sendAttempts++;
       if (sendAttempts >= MAX_SEND_ATTEMPTS) {
@@ -702,19 +731,21 @@
       return;
     }
 
-    const sendBtn = findSendButton();
-    const info = sendBtn ? {
+    // Si existe el botón "Continuar", tiene prioridad sobre "Enviar"
+    const continueBtn = findContinueButton();
+    const targetBtn = continueBtn || findSendButton();
+    const kind = continueBtn ? 'continue' : 'send';
+    const info = targetBtn ? {
+      kind,
       found: true,
-      disabled: sendBtn.disabled,
-      ariaDisabled: sendBtn.getAttribute('aria-disabled')
-    } : { found: false };
+      disabled: targetBtn.disabled,
+      ariaDisabled: targetBtn.getAttribute('aria-disabled')
+    } : { kind, found: false };
     console.log('[ClaudeResetTimer] attempt #' + (sendAttempts + 1), new Date().toLocaleTimeString(), info);
 
-    const enabled = sendBtn && !sendBtn.disabled &&
-      sendBtn.getAttribute('aria-disabled') !== 'true';
-
-    if (enabled) {
-      synthClick(sendBtn);
+    if (isButtonEnabled(targetBtn)) {
+      lastClick = { el: targetBtn, kind };
+      synthClick(targetBtn);
       setStatus(t.statusClickSent);
       autoSendTimer = setTimeout(verifySendResult, 1000);
       return;
