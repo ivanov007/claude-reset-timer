@@ -36,6 +36,17 @@ A lightweight floating panel for **Claude.ai** that detects the rate-limit, show
 | Français | `fr` |
 
 ### Changelog
+
+**v2.1.5**
+
+- Added support for the disabled "Continue" button that sometimes appears instead of the composer. It uses the same reset timer and retry logic as the Send button.
+- "Continue" takes priority over "Send" when both are present.
+- Post-click verification for "Continue" checks that the button disappeared or became disabled again.
+
+**v2.1.4**
+
+- Fixed: after a successful send, the watchdog kept retrying every 20s until the retry limit was reached, which also unchecked "Auto-send" by itself. Each rate-limit cycle is now marked as resolved once its message is sent, and a new cycle re-arms automatically.
+
 **v2.1.3**
 
 Added support for basic and dark mode
