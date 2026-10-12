@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Claude Reset Timer + Auto-Send
 // @namespace    ivanov007.userscripts
-// @version      2.1.5
+// @version      2.1.6
 // @description  Floating panel that detects Claude's rate-limit via fetch, modal, or inline banner. Shows countdown, manual time edit, and auto-clicks Send on reset. Supports English, Spanish, and French.
 // @author       ivanov007
 // @match        https://claude.ai/*
@@ -731,8 +731,11 @@
       return;
     }
 
-    // Si existe el botón "Continuar", tiene prioridad sobre "Enviar"
-    const continueBtn = findContinueButton();
+    // Prioridad: si hay texto escrito, se envía con el botón de enviar.
+    // Solo si el cuadro está vacío se intenta el botón "Continuar".
+    const composer = document.querySelector('div.ProseMirror');
+    const hasText = !!composer && composer.innerText.trim().length > 0;
+    const continueBtn = hasText ? null : findContinueButton();
     const targetBtn = continueBtn || findSendButton();
     const kind = continueBtn ? 'continue' : 'send';
     const info = targetBtn ? {
