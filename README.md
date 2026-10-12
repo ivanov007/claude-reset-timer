@@ -37,6 +37,9 @@ A lightweight floating panel for **Claude.ai** that detects the rate-limit, show
 
 ### Changelog
 
+### 2.1.6
+- Changed button priority: if the composer has text, the Send button is used. The "Continue" button is only tried when the composer is empty.
+
 **v2.1.5**
 
 - Added support for the disabled "Continue" button that sometimes appears instead of the composer. It uses the same reset timer and retry logic as the Send button.
