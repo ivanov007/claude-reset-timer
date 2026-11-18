@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Claude Reset Timer + Auto-Send
 // @namespace    ivanov007.userscripts
-// @version      2.2.0
+// @version      2.2.1
 // @description  Floating panel that detects Claude's rate-limit via fetch, modal, or inline banner. Shows countdown, manual time edit, and auto-clicks Send on reset. Also counts your messages in the current chat and logs usage when the limit is hit. Supports English, Spanish, and French.
 // @author       ivanov007
 // @match        https://claude.ai/*
@@ -56,7 +56,7 @@
       statusTooManyRetries: 'Demasiados reintentos. Auto-envío cancelado.',
       statusWatchdog: 'Watchdog: forzando envío',
       myMsgs: 'Mis msgs',
-      countTitle: 'Tus mensajes en este chat · caracteres totales del chat (estimación del peso)',
+      countTitle: 'Tus mensajes en este chat · caracteres totales del chat (estimación del peso). "~" = aproximado, leído de la pantalla',
       // Modal grande + banner pequeño inline
       modalPatterns: [
         /resets at\s+(\d{1,2}:\d{2}\s?[AP]M)/i,
@@ -93,7 +93,7 @@
       statusTooManyRetries: 'Too many retries. Auto-send cancelled.',
       statusWatchdog: 'Watchdog: forcing send',
       myMsgs: 'My msgs',
-      countTitle: 'Your messages in this chat · total chat characters (weight estimate)',
+      countTitle: 'Your messages in this chat · total chat characters (weight estimate). "~" = approximate, read from the screen',
       modalPatterns: [
         /resets at\s+(\d{1,2}:\d{2}\s?[AP]M)/i,
         /resets?\s+(?:at|in)\s+(\d{1,2}:\d{2}(?:\s?[AP]M)?)/i,
@@ -127,7 +127,7 @@
       statusTooManyRetries: 'Trop de tentatives. Envoi auto annulé.',
       statusWatchdog: 'Watchdog: forçage envoi',
       myMsgs: 'Mes msgs',
-      countTitle: 'Vos messages dans ce chat · caractères totaux du chat (estimation du poids)',
+      countTitle: 'Vos messages dans ce chat · caractères totaux du chat (estimation du poids). "~" = approximatif, lu à l’écran',
       modalPatterns: [
         /r(?:é|e)initiali[sz](?:ation|ation|é)\s+(?:à|a|at)\s+(\d{1,2}[h:]\d{2})/i,
         /r(?:é|e)initiali[sz](?:ation|ation|é)\s+(?:dans|in)\s+(\d{1,2}[h:]\d{2})/i,
@@ -181,7 +181,9 @@
   // Selector confirmado con el HTML real: cada mensaje del usuario es un
   // div[data-testid="user-message"]; cada turno (usuario + Claude) es un
   // [data-transcript-row].
-  function getChatStats() {
+  // Respaldo: cuenta lo que hay PINTADO en pantalla. claude.ai virtualiza la lista,
+  // así que en chats largos esto puede ser menor que el total real.
+  function getDomStats() {
     const msgs = document.querySelectorAll('[data-testid="user-message"]').length;
     let chars = 0;
     document.querySelectorAll('[data-transcript-row]').forEach((row) => {
@@ -193,6 +195,123 @@
       chars += Math.max(0, n);
     });
     return { msgs, chars };
+  }
+
+  // ---- Conteo exacto desde los datos del chat (endpoint interno de claude.ai) ----
+  // Se confirmó en uso real: /api/organizations y
+  // /api/organizations/{org}/chat_conversations/{chat}?tree=True&rendering_mode=messages&render_all_tools=true
+  // devuelven chat_messages (sender, text, content, parent_message_uuid) y
+  // current_leaf_message_uuid. Es un endpoint no documentado: si falla, se usa el DOM.
+  let apiOrgId = null;
+  let apiStats = null;      // { chatId, msgs, chars }
+  let apiFetching = false;
+  let apiPending = false;
+  let apiFailCount = 0;
+  let apiTimer = null;
+
+  function currentChatId() {
+    const m = location.pathname.match(/\/chat\/([0-9a-f-]{36})/i);
+    return m ? m[1] : null;
+  }
+
+  function apiValid() {
+    const id = currentChatId();
+    return !!(apiStats && id && apiStats.chatId === id);
+  }
+
+  function messageChars(m) {
+    let n = 0;
+    if (Array.isArray(m.content)) {
+      for (const b of m.content) {
+        if (b && typeof b.text === 'string') n += b.text.length;
+      }
+    }
+    if (n === 0 && typeof m.text === 'string') n = m.text.length;
+    return n;
+  }
+
+  // Con tree=True la respuesta puede incluir ramas abandonadas (ediciones/reintentos).
+  // Solo cuenta la rama activa: desde current_leaf_message_uuid hacia atrás.
+  function computeBranchStats(conv) {
+    const list = Array.isArray(conv.chat_messages) ? conv.chat_messages : [];
+    const byId = new Map(list.map((m) => [m.uuid, m]));
+    let branch = [];
+    let cur = byId.get(conv.current_leaf_message_uuid);
+    if (cur) {
+      const seen = new Set();
+      while (cur && !seen.has(cur.uuid)) {
+        seen.add(cur.uuid);
+        branch.push(cur);
+        cur = byId.get(cur.parent_message_uuid);
+      }
+    } else {
+      branch = list; // sin hoja conocida: se cuentan todos
+    }
+    let msgs = 0, chars = 0;
+    for (const m of branch) {
+      if (m.sender === 'human') msgs++;
+      chars += messageChars(m);
+    }
+    return { msgs, chars, branchLen: branch.length, total: list.length };
+  }
+
+  async function apiGetJson(url) {
+    const r = await origFetch.call(window, url, { credentials: 'same-origin' });
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    return r.json();
+  }
+
+  async function refreshApiStats() {
+    const chatId = currentChatId();
+    if (!chatId || apiFailCount >= 3) return;
+    if (apiFetching) { apiPending = true; return; }
+    apiFetching = true;
+    try {
+      const path = (org) => `/api/organizations/${org}/chat_conversations/${chatId}?tree=True&rendering_mode=messages&render_all_tools=true`;
+      let conv = null;
+      if (apiOrgId) {
+        conv = await apiGetJson(path(apiOrgId));
+      } else {
+        const orgs = await apiGetJson('/api/organizations');
+        for (const o of (Array.isArray(orgs) ? orgs : [])) {
+          try {
+            conv = await apiGetJson(path(o.uuid));
+            apiOrgId = o.uuid;
+            break;
+          } catch (e) { /* probar la siguiente organización */ }
+        }
+        if (!conv) throw new Error('no organization returned the conversation');
+      }
+      const s = computeBranchStats(conv);
+      if (currentChatId() === chatId) {
+        apiStats = { chatId, msgs: s.msgs, chars: s.chars };
+      }
+      apiFailCount = 0;
+      console.log('[ClaudeResetTimer] chat stats (API)', { msgs: s.msgs, chars: s.chars, branchLen: s.branchLen, total: s.total });
+    } catch (e) {
+      apiFailCount++;
+      console.log('[ClaudeResetTimer] chat stats API failed (' + apiFailCount + '/3), using DOM fallback', e);
+    } finally {
+      apiFetching = false;
+      if (typeof updateCounter === 'function') updateCounter();
+      if (apiPending) {
+        apiPending = false;
+        scheduleApiRefresh(300);
+      }
+    }
+  }
+
+  function scheduleApiRefresh(delay) {
+    if (apiTimer) clearTimeout(apiTimer);
+    apiTimer = setTimeout(() => { apiTimer = null; refreshApiStats(); }, delay);
+  }
+
+  // Estadísticas a mostrar/registrar: API si es válida para este chat; si no, DOM (aprox.)
+  function getChatStats() {
+    if (apiValid()) return { msgs: apiStats.msgs, chars: apiStats.chars, approx: false };
+    const d = getDomStats();
+    d.approx = true;
+    return d;
   }
 
   function isOverThreshold(s) {
@@ -216,6 +335,7 @@
         source,
         msgs: s.msgs,
         chars: s.chars,
+        approx: s.approx, // true = leído del DOM (puede estar incompleto)
         path: location.pathname,
       };
       log.push(rec);
@@ -267,6 +387,8 @@
                 if (resetsAt) {
                   applyResetFromUnixSeconds(resetsAt, 'fetch');
                 }
+                // Terminó una respuesta (enviar, editar o reintentar): recontar
+                if (url.includes('/completion')) scheduleApiRefresh(800);
               })
               .catch(() => {});
           } catch (e) {}
@@ -599,7 +721,8 @@
 
   function updateCounter() {
     const s = getChatStats();
-    const text = `${t.myMsgs} ${s.msgs} · ${fmtChars(s.chars)}`;
+    const tilde = s.approx ? '~' : '';
+    const text = `${t.myMsgs} ${tilde}${s.msgs} · ${tilde}${fmtChars(s.chars)}`;
     // Solo se escribe si cambió, para no generar mutaciones innecesarias
     if (countEl.textContent !== text) countEl.textContent = text;
     countEl.classList.toggle('crt-warn', isOverThreshold(s));
@@ -617,6 +740,8 @@
   }
 
   const countObserver = new MutationObserver((mutations) => {
+    // Con datos de la API el DOM no hace falta (y se evita el costo en chats largos)
+    if (apiValid()) return;
     // Ignorar los cambios del propio panel para no entrar en bucle
     if (mutations.every((m) => panel.contains(m.target))) return;
     scheduleCount();
@@ -628,11 +753,14 @@
   setInterval(() => {
     if (location.pathname !== lastPath) {
       lastPath = location.pathname;
+      apiFailCount = 0;
       scheduleCount();
+      scheduleApiRefresh(300);
     }
   }, 2000);
 
   updateCounter();
+  refreshApiStats();
 
   // ======================== MANUAL EDIT ========================
   editBtn.addEventListener('click', () => {
