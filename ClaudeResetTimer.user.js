@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Claude Reset Timer + Auto-Send
 // @namespace    ivanov007.userscripts
-// @version      2.1.6
-// @description  Floating panel that detects Claude's rate-limit via fetch, modal, or inline banner. Shows countdown, manual time edit, and auto-clicks Send on reset. Supports English, Spanish, and French.
+// @version      2.2.0
+// @description  Floating panel that detects Claude's rate-limit via fetch, modal, or inline banner. Shows countdown, manual time edit, and auto-clicks Send on reset. Also counts your messages in the current chat and logs usage when the limit is hit. Supports English, Spanish, and French.
 // @author       ivanov007
 // @match        https://claude.ai/*
 // @grant        GM_setValue
@@ -21,6 +21,17 @@
   const MAX_SEND_ATTEMPTS = 20;
   const BASE_RETRY_DELAY = 3000;
   const MAX_RETRY_DELAY = 15000;
+  const SEND_DELAY_MS = 5000;   // espera tras resetAt antes del primer clic
+  const VERIFY_DELAY_MS = 5000; // espera tras un clic de enviar/reintentar antes de verificar
+  const PANEL_WIDTH = 560;      // px; antes 500, ampliado para el contador de mensajes
+  const COUNT_THROTTLE_MS = 1500; // frecuencia máxima de recálculo del contador
+  const MAX_LIMIT_LOG = 20;       // registros de límite alcanzado que se conservan
+
+  // Aviso por umbral: preparado pero DESACTIVADO. Cuando tengas datos reales en el
+  // registro de límites, pon WARN_ENABLED = true y define uno o ambos umbrales.
+  const WARN_ENABLED = false;
+  const WARN_MSGS = null;   // ej. 25  -> avisa al llegar a 25 mensajes tuyos en el chat
+  const WARN_CHARS = null;  // ej. 60000 -> avisa al llegar a ~60k caracteres en el chat
 
   // Auto-detect language from <html lang> or navigator, allow manual override
   const detectedLang = (document.documentElement.lang || navigator.language || 'en').slice(0, 2).toLowerCase();
@@ -44,6 +55,8 @@
       statusBtnNotReady: 'Botón no disponible aún, reintentando...',
       statusTooManyRetries: 'Demasiados reintentos. Auto-envío cancelado.',
       statusWatchdog: 'Watchdog: forzando envío',
+      myMsgs: 'Mis msgs',
+      countTitle: 'Tus mensajes en este chat · caracteres totales del chat (estimación del peso)',
       // Modal grande + banner pequeño inline
       modalPatterns: [
         /resets at\s+(\d{1,2}:\d{2}\s?[AP]M)/i,
@@ -59,6 +72,8 @@
       ],
       sendBtnLabels: ['Send message', 'Enviar mensaje', 'Envoyer le message'],
       continueBtnLabels: ['continuar', 'continue', 'continuer'],
+      retryBtnLabels: ['reintentar', 'volver a intentar', 'retry', 'try again', 'réessayer', 'reessayer'],
+      statusRetrying: 'Envío fallido, pulsando Reintentar...',
       ampm: true,
     },
     en: {
@@ -77,6 +92,8 @@
       statusBtnNotReady: 'Button not ready yet, retrying...',
       statusTooManyRetries: 'Too many retries. Auto-send cancelled.',
       statusWatchdog: 'Watchdog: forcing send',
+      myMsgs: 'My msgs',
+      countTitle: 'Your messages in this chat · total chat characters (weight estimate)',
       modalPatterns: [
         /resets at\s+(\d{1,2}:\d{2}\s?[AP]M)/i,
         /resets?\s+(?:at|in)\s+(\d{1,2}:\d{2}(?:\s?[AP]M)?)/i,
@@ -89,6 +106,8 @@
       ],
       sendBtnLabels: ['Send message', 'Enviar mensaje', 'Envoyer le message'],
       continueBtnLabels: ['continue', 'continuar', 'continuer'],
+      retryBtnLabels: ['retry', 'try again', 'reintentar', 'volver a intentar', 'réessayer', 'reessayer'],
+      statusRetrying: 'Send failed, clicking Retry...',
       ampm: true,
     },
     fr: {
@@ -107,6 +126,8 @@
       statusBtnNotReady: 'Bouton non prêt, nouvelle tentative...',
       statusTooManyRetries: 'Trop de tentatives. Envoi auto annulé.',
       statusWatchdog: 'Watchdog: forçage envoi',
+      myMsgs: 'Mes msgs',
+      countTitle: 'Vos messages dans ce chat · caractères totaux du chat (estimation du poids)',
       modalPatterns: [
         /r(?:é|e)initiali[sz](?:ation|ation|é)\s+(?:à|a|at)\s+(\d{1,2}[h:]\d{2})/i,
         /r(?:é|e)initiali[sz](?:ation|ation|é)\s+(?:dans|in)\s+(\d{1,2}[h:]\d{2})/i,
@@ -118,6 +139,8 @@
       ],
       sendBtnLabels: ['Envoyer le message', 'Send message', 'Enviar mensaje'],
       continueBtnLabels: ['continuer', 'continue', 'continuar'],
+      retryBtnLabels: ['réessayer', 'reessayer', 'retry', 'try again', 'reintentar', 'volver a intentar'],
+      statusRetrying: 'Échec de l’envoi, clic sur Réessayer...',
       ampm: false,
     },
   };
@@ -134,11 +157,12 @@
       sentForResetAt: typeof raw.sentForResetAt === 'number' ? raw.sentForResetAt : null,
       snap: raw.snap || { left: false, right: true, top: false, bottom: true },
       lang: supportedLangs.includes(raw.lang) ? raw.lang : lang,
+      limitLog: Array.isArray(raw.limitLog) ? raw.limitLog.slice(-MAX_LIMIT_LOG) : [],
     };
   }
 
   const state = Object.assign(
-    { x: null, y: null, autoSend: false, resetAt: null, sentForResetAt: null, snap: null, lang },
+    { x: null, y: null, autoSend: false, resetAt: null, sentForResetAt: null, snap: null, lang, limitLog: [] },
     sanitizeState(GM_getValue(STORAGE_KEY, {}))
   );
 
@@ -153,11 +177,63 @@
   let autoSendTimer = null;
   let sendAttempts = 0;
 
+  // ======================== CHAT STATS & LIMIT LOG ========================
+  // Selector confirmado con el HTML real: cada mensaje del usuario es un
+  // div[data-testid="user-message"]; cada turno (usuario + Claude) es un
+  // [data-transcript-row].
+  function getChatStats() {
+    const msgs = document.querySelectorAll('[data-testid="user-message"]').length;
+    let chars = 0;
+    document.querySelectorAll('[data-transcript-row]').forEach((row) => {
+      let n = (row.textContent || '').length;
+      // Los elementos sr-only [data-find-omitted] duplican texto; se restan.
+      row.querySelectorAll('[data-find-omitted]').forEach((el) => {
+        n -= (el.textContent || '').length;
+      });
+      chars += Math.max(0, n);
+    });
+    return { msgs, chars };
+  }
+
+  function isOverThreshold(s) {
+    if (!WARN_ENABLED) return false;
+    return (WARN_MSGS !== null && s.msgs >= WARN_MSGS) ||
+           (WARN_CHARS !== null && s.chars >= WARN_CHARS);
+  }
+
+  // Guarda cuántos mensajes/caracteres tenía el chat al alcanzar el límite.
+  // Se deduplica por hora de reinicio (fetch y aviso suelen detectar el mismo ciclo).
+  function logLimitHit(source, resetAtMs) {
+    try {
+      const log = Array.isArray(state.limitLog) ? state.limitLog : [];
+      const last = log[log.length - 1];
+      if (last && Math.abs(last.resetAt - resetAtMs) < 120000) return;
+      const s = getChatStats();
+      const rec = {
+        at: new Date().toLocaleString(),
+        resetAt: resetAtMs, // numérico (ms) para deduplicar
+        resetAtLocal: new Date(resetAtMs).toLocaleString(),
+        source,
+        msgs: s.msgs,
+        chars: s.chars,
+        path: location.pathname,
+      };
+      log.push(rec);
+      state.limitLog = log.slice(-MAX_LIMIT_LOG);
+      saveState();
+      console.log('[ClaudeResetTimer] limit hit', rec);
+      console.table(state.limitLog);
+    } catch (e) {
+      console.log('[ClaudeResetTimer] limit log error', e);
+    }
+  }
+
   // ======================== FETCH INTERCEPTOR ========================
   function applyResetFromUnixSeconds(unixSeconds, source) {
     const ms = unixSeconds * 1000;
     if (state.resetAt === ms) return;
     state.resetAt = ms;
+    logLimitHit(source, ms);
     saveState();
     render();
     setStatus(t.statusDetected(source, new Date().toLocaleTimeString()));
@@ -224,6 +300,10 @@
         </label>
         <div id="crt-status"></div>
       </div>
+      <div id="crt-divider2"></div>
+      <div class="crt-col" id="crt-col-count">
+        <span id="crt-count" title="${t.countTitle}">${t.myMsgs} --</span>
+      </div>
     </div>
   `;
   document.body.appendChild(panel);
@@ -245,7 +325,7 @@
 
       position: fixed;
       height: 28px;
-      width: 500px;
+      width: ${PANEL_WIDTH}px;
       display: flex;
       flex-direction: row;
       background: var(--crt-bg);
@@ -306,6 +386,7 @@
     }
     #crt-col-time { flex: 1.2; }
     #crt-col-actions { flex: 1; }
+    #crt-col-count { flex: 0 0 auto; }
     #crt-row {
       display: flex;
       align-items: center;
@@ -339,7 +420,17 @@
       color: var(--crt-text-dim2);
       font-size: 10px;
     }
-    #crt-divider {
+    #crt-count {
+      color: var(--crt-text-dim2);
+      font-size: 10px;
+      white-space: nowrap;
+    }
+    #crt-count.crt-warn {
+      color: #e5534b;
+      font-weight: 600;
+    }
+    #crt-divider,
+    #crt-divider2 {
       align-self: stretch;
       width: 1px;
       background: var(--crt-border);
@@ -402,7 +493,7 @@
   }
 
   function applySnap() {
-    const w = panel.offsetWidth || 500;
+    const w = panel.offsetWidth || PANEL_WIDTH;
     const h = panel.offsetHeight || 28;
     if (state.snap.left) state.x = SNAP_MARGIN;
     if (state.snap.right) state.x = window.innerWidth - w - SNAP_MARGIN;
@@ -499,6 +590,50 @@
   setInterval(render, 30000);
   render();
 
+  // ======================== MESSAGE COUNTER ========================
+  const countEl = panel.querySelector('#crt-count');
+
+  function fmtChars(n) {
+    return n >= 1000 ? (n / 1000).toFixed(1).replace(/\.0$/, '') + 'k' : String(n);
+  }
+
+  function updateCounter() {
+    const s = getChatStats();
+    const text = `${t.myMsgs} ${s.msgs} · ${fmtChars(s.chars)}`;
+    // Solo se escribe si cambió, para no generar mutaciones innecesarias
+    if (countEl.textContent !== text) countEl.textContent = text;
+    countEl.classList.toggle('crt-warn', isOverThreshold(s));
+  }
+
+  // Limitador de frecuencia: durante el streaming de una respuesta el DOM cambia
+  // sin parar; se recalcula como máximo cada COUNT_THROTTLE_MS.
+  let countTimer = null;
+  function scheduleCount() {
+    if (countTimer) return;
+    countTimer = setTimeout(() => {
+      countTimer = null;
+      updateCounter();
+    }, COUNT_THROTTLE_MS);
+  }
+
+  const countObserver = new MutationObserver((mutations) => {
+    // Ignorar los cambios del propio panel para no entrar en bucle
+    if (mutations.every((m) => panel.contains(m.target))) return;
+    scheduleCount();
+  });
+  countObserver.observe(document.body, { childList: true, subtree: true, characterData: true });
+
+  // claude.ai es una SPA: al cambiar de chat solo cambia la URL y el DOM se rehace
+  let lastPath = location.pathname;
+  setInterval(() => {
+    if (location.pathname !== lastPath) {
+      lastPath = location.pathname;
+      scheduleCount();
+    }
+  }, 2000);
+
+  updateCounter();
+
   // ======================== MANUAL EDIT ========================
   editBtn.addEventListener('click', () => {
     const current = state.resetAt ? new Date(state.resetAt) : new Date();
@@ -546,7 +681,9 @@
       const parsed = parseTimeStrToDate(timeStr);
       if (!parsed) continue;
 
+      const changed = state.resetAt !== parsed.getTime();
       state.resetAt = parsed.getTime();
+      if (changed) logLimitHit('banner/modal', state.resetAt);
       saveState();
       render();
       setStatus(t.statusDetected('banner/modal', new Date().toLocaleTimeString()));
@@ -624,7 +761,9 @@
     sendAttempts = 0;
     if (!state.resetAt) return;
     if (alreadySentForCurrentCycle()) return;
-    const delay = state.resetAt - Date.now();
+    // Se espera SEND_DELAY_MS extra: al segundo exacto del reinicio el servidor
+    // a veces todavía rechaza el envío.
+    const delay = state.resetAt + SEND_DELAY_MS - Date.now();
     if (delay <= 0) {
       attemptSend();
       return;
@@ -660,11 +799,21 @@
     }) || null;
   }
 
+  // El enlace "Reintentar" es un <span role="button">, no un <button>.
+  function findRetryLink() {
+    const labels = t.retryBtnLabels;
+    return [...document.querySelectorAll('[role="button"], button')].find(el => {
+      if (panel.contains(el)) return false;
+      const txt = (el.textContent || '').trim().toLowerCase();
+      return labels.includes(txt);
+    }) || null;
+  }
+
   function isButtonEnabled(btn) {
     return !!btn && !btn.disabled && btn.getAttribute('aria-disabled') !== 'true';
   }
 
-  let lastClick = null; // { el, kind: 'send' | 'continue' }
+  let lastClick = null; // { el, kind: 'send' | 'continue' | 'retry' }
 
   function synthClick(el) {
     const rect = el.getBoundingClientRect();
@@ -693,10 +842,19 @@
       const stillThere = document.contains(lastClick.el) && isButtonEnabled(lastClick.el);
       failed = stillThere;
       console.log('[ClaudeResetTimer] post-click verification (continue)', new Date().toLocaleTimeString(), { stillThere });
+    } else if (lastClick && lastClick.kind === 'retry') {
+      // Reintentar: éxito si el enlace desapareció
+      const retryStillThere = !!findRetryLink();
+      failed = retryStillThere;
+      console.log('[ClaudeResetTimer] post-click verification (retry)', new Date().toLocaleTimeString(), { retryStillThere });
     } else {
+      // Enviar: falla si el texto sigue en el cuadro O si apareció el enlace
+      // "Reintentar" (el mensaje pasó al chat con error y el cuadro quedó vacío).
       const composer = document.querySelector('div.ProseMirror');
-      failed = !!composer && composer.innerText.trim().length > 0;
-      console.log('[ClaudeResetTimer] post-click verification (send)', new Date().toLocaleTimeString(), { stillHasText: failed });
+      const stillHasText = !!composer && composer.innerText.trim().length > 0;
+      const retryStillThere = !!findRetryLink();
+      failed = stillHasText || retryStillThere;
+      console.log('[ClaudeResetTimer] post-click verification (send)', new Date().toLocaleTimeString(), { stillHasText, retryStillThere });
     }
 
     if (failed) {
@@ -731,13 +889,15 @@
       return;
     }
 
-    // Prioridad: si hay texto escrito, se envía con el botón de enviar.
-    // Solo si el cuadro está vacío se intenta el botón "Continuar".
+    // Prioridad: 1) enlace "Reintentar" si un envío anterior falló;
+    // 2) si hay texto escrito, botón de enviar;
+    // 3) si el cuadro está vacío, botón "Continuar" (y al final el de enviar).
+    const retryLink = findRetryLink();
     const composer = document.querySelector('div.ProseMirror');
     const hasText = !!composer && composer.innerText.trim().length > 0;
-    const continueBtn = hasText ? null : findContinueButton();
-    const targetBtn = continueBtn || findSendButton();
-    const kind = continueBtn ? 'continue' : 'send';
+    const continueBtn = (retryLink || hasText) ? null : findContinueButton();
+    const targetBtn = retryLink || continueBtn || findSendButton();
+    const kind = retryLink ? 'retry' : (continueBtn ? 'continue' : 'send');
     const info = targetBtn ? {
       kind,
       found: true,
@@ -749,8 +909,9 @@
     if (isButtonEnabled(targetBtn)) {
       lastClick = { el: targetBtn, kind };
       synthClick(targetBtn);
-      setStatus(t.statusClickSent);
-      autoSendTimer = setTimeout(verifySendResult, 1000);
+      setStatus(kind === 'retry' ? t.statusRetrying : t.statusClickSent);
+      // "Continuar" desaparece casi al instante; enviar/reintentar necesitan más margen
+      autoSendTimer = setTimeout(verifySendResult, kind === 'continue' ? 1000 : VERIFY_DELAY_MS);
       return;
     }
 
@@ -761,7 +922,7 @@
 
   // Resume on page load
   if (state.autoSend && state.resetAt && !alreadySentForCurrentCycle()) {
-    if (state.resetAt > Date.now()) {
+    if (state.resetAt + SEND_DELAY_MS > Date.now()) {
       scheduleAutoSend();
     } else {
       attemptSend();
